@@ -1,13 +1,7 @@
----
-title: "Actionable Instructor-facing Learning Analytics in Clinical Mind AI: Interpretable Insights from Clinical Reasoning Simulations"
-author: "Marcos Rojas, Emina Garcia"
-affiliation: "Stanford University"
-date: "`r Sys.Date()`"
-output: 
-  pdf_document:
-    toc: true
-    number_sections: true
----
+# <p style="text-align: center;">Actionable Instructor-facing Learning Analytics in Clinical Mind AI: Interpretable Insights From Clinical Reasoning Simulations</p>
+### <p style="text-align: center;">Marcos Rojas, Emina Garcia</p>
+
+
 
 # Introduction
 
