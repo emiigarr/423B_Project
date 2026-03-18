@@ -1,0 +1,1256 @@
+## Data Preprocessing
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(stringr)
+```
+
+
+```{r}
+data_dir <- "/Users/Emina/Desktop/School/Stanford/EDUC 423B/FinalProject/Data"
+
+perf_files <- c(
+  "Case 1 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762323818623.csv",
+  "Case 2 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762324066549.csv",
+  "Case 3 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762324404887.csv",
+  "Case 4 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762329552913.csv",
+  "Case 5 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762331930830.csv",
+  "Case 6 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762332005256.csv",
+  "Case 7 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762373034693.csv",
+  "Case 8 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762372959944.csv")
+
+msg_files <- c(
+  "Case 1 messages_export_1762323926511.csv",
+  "Case 2 messages_export_1762324188309.csv",
+  "Case 3 messages_export_1762329513678.csv",
+  "Case 6 messages_export_1762332088572.csv",
+  "Case 7 messages_export_1762372921944.csv",
+  "Case 8 messages_export_1762373120016.csv")
+
+get_case_number <- function(x) {
+  str_extract(x, "(?i)case\\s*\\d+") |>
+    str_extract("\\d+") |>
+    as.integer()}
+
+read_perf <- function(fname) {
+  read_csv(
+    file.path(data_dir, fname),
+    show_col_types = FALSE,
+    col_types = cols(.default = col_character()))|>
+    clean_names() |>
+    mutate(
+      source_file = fname,
+      case_number = get_case_number(fname))}
+
+read_msgs <- function(fname) {
+  read_csv(
+    file.path(data_dir, fname),
+    show_col_types = FALSE,
+    col_types = cols(.default = col_character()))|>
+    clean_names() |>
+    mutate(
+      source_file = fname,
+      case_number = get_case_number(fname))}
+
+perf_long <- perf_files |>
+  map_dfr(read_perf)
+
+conv_long <- msg_files |>
+  map_dfr(read_msgs)
+```
+
+The conversation dataset contains 142,222 observations across 17 variables, whereas the clinical case performance dataset contains 17,119 observations across 30 variables.
+
+```{r}
+glimpse(conv_long)
+glimpse(perf_long)
+```
+
+Considering all the variables in this dataset, we'll keep the ones that identify the student only.
+
+```{r}
+options(dplyr.summarise.inform = FALSE)
+
+parse_platform_time <- function(x) {
+  x|>
+    str_remove(" GMT.*$")|>
+    as.POSIXct(format = "%a %b %d %Y %H:%M:%S", tz = "UTC")}
+
+safe_chr_first <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) NA_character_ else x[1]}
+
+safe_num_first <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else x[1]}
+
+safe_num_last <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else x[length(x)]}
+
+safe_num_max <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else max(x)}
+
+safe_time_min <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) as.POSIXct(NA) else min(x, na.rm = TRUE)}
+
+safe_time_max <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) as.POSIXct(NA) else max(x, na.rm = TRUE)}
+
+perf_clean <- perf_long |>
+  select(
+    attempt_id,
+    course_clinical_activity_id,
+    response_by_id,
+    response_by_role,
+    achieved_score,
+    max_score,
+    attempt_no,
+    performed_at,
+    case_number)|>
+  mutate(
+    attempt_id = as.character(attempt_id),
+    course_clinical_activity_id = as.character(course_clinical_activity_id),
+    response_by_id = as.character(response_by_id),
+    response_by_role = toupper(as.character(response_by_role)),
+    achieved_score = as.numeric(achieved_score),
+    max_score = as.numeric(max_score),
+    attempt_no = as.numeric(attempt_no),
+    performed_at = parse_platform_time(performed_at))|>
+  filter(is.na(response_by_role) | response_by_role == "STUDENT")
+
+conv_clean <- conv_long |>
+  select(
+    attempt_id,
+    clinical_activity_id,
+    user_id,
+    role,
+    timestamp,
+    medical_history_duration,
+    case_number)|>
+  mutate(
+    attempt_id = as.character(attempt_id),
+    clinical_activity_id = as.character(clinical_activity_id),
+    user_id = as.character(user_id),
+    role = tolower(as.character(role)),
+    timestamp = parse_platform_time(timestamp),
+    medical_history_duration = as.numeric(medical_history_duration))
+
+perf_attempt <- perf_clean |>
+  group_by(attempt_id, case_number) |>
+  summarise(
+    student_id = safe_chr_first(response_by_id),
+    case_id = safe_chr_first(course_clinical_activity_id),
+    attempt_no = safe_num_first(sort(unique(na.omit(attempt_no)))),
+
+    attempt_start_ts = safe_time_min(performed_at),
+    attempt_end_ts = safe_time_max(performed_at),
+
+    points_earned_attempt = sum(achieved_score, na.rm = TRUE),
+    points_possible_attempt = sum(max_score, na.rm = TRUE),
+    score_pct_attempt = if_else(
+      points_possible_attempt > 0,
+      points_earned_attempt / points_possible_attempt,
+      NA_real_),
+    .groups = "drop")
+
+conv_attempt <- conv_clean |>
+  group_by(attempt_id, case_number) |>
+  summarise(
+    student_id = safe_chr_first(user_id),
+    case_id = safe_chr_first(clinical_activity_id),
+
+    student_messages_attempt = sum(role == "user", na.rm = TRUE),
+    total_messages_attempt = n(),
+    medical_history_duration_attempt = safe_num_max(medical_history_duration),
+
+    conversation_start_ts = safe_time_min(timestamp),
+    conversation_end_ts = safe_time_max(timestamp),
+    conversation_span_seconds = as.numeric(conversation_end_ts - conversation_start_ts),
+    .groups = "drop")
+
+conversation_enabled_tbl <- tibble(case_number = 1:8) |>
+  mutate(
+    conversation_enabled = if_else(case_number %in% c(1, 2, 3, 6, 7, 8), 1L, 0L))
+
+attempt_master <- perf_attempt |>
+  left_join(conv_attempt, by = c("attempt_id", "case_number"), suffix = c("_perf", "_conv"))|>
+  mutate(
+    student_id = coalesce(student_id_perf, student_id_conv),
+    case_id = coalesce(case_id_perf, case_id_conv))|>
+  select(
+    attempt_id,
+    case_number,
+    student_id,
+    case_id,
+    attempt_no,
+    attempt_start_ts,
+    attempt_end_ts,
+    points_earned_attempt,
+    points_possible_attempt,
+    score_pct_attempt,
+    student_messages_attempt,
+    total_messages_attempt,
+    medical_history_duration_attempt,
+    conversation_start_ts,
+    conversation_end_ts,
+    conversation_span_seconds)|>
+  left_join(conversation_enabled_tbl, by = "case_number")|>
+  mutate(
+    student_messages_attempt = if_else(conversation_enabled == 0, 0L, coalesce(student_messages_attempt, 0L)),
+    total_messages_attempt = if_else(conversation_enabled == 0, 0L, coalesce(total_messages_attempt, 0L)),
+    medical_history_duration_attempt = if_else(conversation_enabled == 0, 0, coalesce(medical_history_duration_attempt, 0)),
+    conversation_span_seconds = if_else(conversation_enabled == 0, 0, coalesce(conversation_span_seconds, 0)))
+```
+
+## Data wrangling
+
+Because each student completed only one attempt per case, the merged attempt-level dataset could be used directly to construct the final student-level analytic file. At this stage, we retained the variables most relevant to the present project: whether the student attempted the case, the total points earned in that case, a standardized score, the number of student-authored messages in the associated chatbot interaction, and the total conversation duration in seconds. To make performance comparable across cases with different scoring scales, we standardized each student’s score using the maximum observed points earned in that case. Case 7 was delivered without feedback, so performance variables for that case were treated as missing rather than interpreted as true zero scores, although conversation-derived variables were retained. We then created a complete student-by-case grid so that every student had an explicit record for each of the eight cases. Finally, we reshaped the dataset into wide format so that the final database contained one row per unique student and case-specific variables as separate columns.
+
+```{r}
+case_max_scores <- attempt_master |>
+  filter(case_number != 7) |>
+  group_by(case_number) |>
+  summarise(
+    case_max_points = max(points_earned_attempt, na.rm = TRUE),
+    .groups = "drop")
+
+student_case_panel <- attempt_master |>
+  arrange(student_id, case_number, attempt_no, attempt_start_ts) |>
+  group_by(student_id, case_number) |>
+  summarise(
+    attempted_case = 1L,
+    points_earned_case = if_else(case_number[1] == 7, NA_real_, first(points_earned_attempt)),
+    student_messages_case = first(student_messages_attempt),
+    conversation_seconds_case = first(conversation_span_seconds),
+    .groups = "drop") |>
+  left_join(case_max_scores, by = "case_number") |>
+  mutate(
+    score_pct_case = case_when(
+      case_number == 7 ~ NA_real_,
+      !is.na(case_max_points) & case_max_points > 0 ~ points_earned_case / case_max_points,
+      TRUE ~ NA_real_)) |>
+  select(-case_max_points)
+
+all_students <- attempt_master |>
+  distinct(student_id) |>
+  filter(!is.na(student_id))
+
+student_case_grid <- tidyr::crossing(
+  all_students,
+  tibble(case_number = 1:8))
+
+student_case_panel_complete <- student_case_grid |>
+  left_join(student_case_panel, by = c("student_id", "case_number")) |>
+  mutate(
+    attempted_case = coalesce(attempted_case, 0L),
+    student_messages_case = coalesce(student_messages_case, 0L),
+    conversation_seconds_case = coalesce(conversation_seconds_case, 0))
+
+student_wide <- student_case_panel_complete |>
+  pivot_wider(
+    names_from = case_number,
+    values_from = c(
+      attempted_case,
+      points_earned_case,
+      score_pct_case,
+      student_messages_case,
+      conversation_seconds_case),
+    names_glue = "{.value}_c{case_number}")
+
+glimpse(student_wide)
+summary(student_wide)
+```
+
+```{r}
+dir.create("output", showWarnings = FALSE)
+write_csv(student_wide, "output/student_wide.csv")
+```
+
+## PCA
+```{r}
+# Import necessary packages for PCA
+library(FactoMineR)
+library(factoextra)
+library(tidytext)
+library(corrplot)
+library(gridExtra)
+library(tidyverse)
+library(mclust)
+library(ggrepel)
+```
+
+```{r}
+# Opening the database first and save in the environment
+student_wide <- read_csv("/Users/Emina/Desktop/School/Stanford/EDUC 423B/output/student_wide.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Finding bottom 20% on case 8
+bottom20 <- quantile(student_wide$score_pct_case_c8, 0.20, na.rm = TRUE)
+print(bottom20) # 0.875 
+```
+
+```{r}
+# Create a new at_risk column: 1 = at-risk (bottom 20%), 0 = not at risk
+student_wide <- student_wide |>
+  mutate(
+    at_risk = if_else(score_pct_case_c8 <= bottom20, 1L, 0L)
+  )
+
+# Checking how many students are at risk or not 
+table(student_wide$at_risk)
+```
+
+
+```{r}
+# Replacing NA Scores with 0 for non-attempters
+student_wide <- student_wide |>
+  mutate(
+    across(starts_with("score_pct_case_c"), ~ replace_na(., 0))
+  )
+```
+
+
+```{r}
+# Building Three Predictor Windows
+# Window 1: Only information from Case 1
+window1_data <- student_wide |>
+  select(
+    student_id,
+    at_risk,
+    score_pct_case_c1,
+    student_messages_case_c1,
+    conversation_seconds_case_c1,
+    attempted_case_c1
+  ) |>
+  filter(!is.na(at_risk))   # Only drop students with no Case 8 outcome
+
+# Window 2: Information from Cases 1 and 2
+window2_data <- student_wide |>
+  select(
+    student_id,
+    at_risk,
+    score_pct_case_c1,
+    student_messages_case_c1,
+    conversation_seconds_case_c1,
+    attempted_case_c1,
+    score_pct_case_c2,
+    student_messages_case_c2,
+    conversation_seconds_case_c2,
+    attempted_case_c2
+  ) |>
+  filter(!is.na(at_risk))
+
+# Window 3: Information from Cases 1, 2, and 3 
+window3_data <- student_wide |>
+  select(
+    student_id,
+    at_risk,
+    score_pct_case_c1,
+    student_messages_case_c1,
+    conversation_seconds_case_c1,
+    attempted_case_c1,
+    score_pct_case_c2,
+    student_messages_case_c2,
+    conversation_seconds_case_c2,
+    attempted_case_c2,
+    score_pct_case_c3,
+    student_messages_case_c3,
+    conversation_seconds_case_c3,
+    attempted_case_c3
+  ) |>
+  filter(!is.na(at_risk))
+
+# Window 4: Information from Cases 1, 2, 3, and 4
+window4_data <- student_wide |>
+  select(
+    student_id,
+    at_risk,
+    score_pct_case_c1,
+    student_messages_case_c1,
+    conversation_seconds_case_c1,
+    attempted_case_c1,
+    score_pct_case_c2,
+    student_messages_case_c2,
+    conversation_seconds_case_c2,
+    attempted_case_c2,
+    score_pct_case_c3,
+    student_messages_case_c3,
+    conversation_seconds_case_c3,
+    attempted_case_c3,
+    score_pct_case_c4,
+    student_messages_case_c4,
+    conversation_seconds_case_c4,
+    attempted_case_c4
+  ) |>
+  filter(!is.na(at_risk))
+
+# Check how many students remain in each window
+nrow(window1_data) # 231
+nrow(window2_data) # 231
+nrow(window3_data) # 231
+nrow(window4_data) # 231
+```
+
+
+```{r}
+# Running PCA for each window
+# Removing studentid and at_risk to prevent leakage
+
+pca_w1 <- PCA(
+  window1_data |> 
+    select(-student_id, -at_risk),
+    scale.unit = TRUE,    # Standardize all variables
+    graph = FALSE         # Suppress automatic plots for now
+)
+
+pca_w2 <- PCA(
+  window2_data |> select(-student_id, -at_risk),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+pca_w3 <- PCA(
+  window3_data |> select(-student_id, -at_risk),
+  scale.unit = TRUE,
+  graph = FALSE
+)
+
+pca_w4 <- PCA(
+  window4_data |> 
+    select(-student_id, -at_risk, -student_messages_case_c4, -conversation_seconds_case_c4),
+    scale.unit = TRUE,   
+    graph = FALSE         
+)
+
+```
+
+
+### Looking at eigenvalues per window
+```{r}
+get_eigenvalue(pca_w1)
+```
+
+```{r}
+get_eigenvalue(pca_w2)
+```
+
+```{r}
+get_eigenvalue(pca_w3)
+```
+
+```{r}
+get_eigenvalue(pca_w4)
+```
+
+### Screeplot
+```{r}
+s1 <- fviz_eig(pca_w1, addlabels = TRUE,
+  title = "Window 1 (After Case 1)"
+  ) + theme_minimal()
+```
+
+```{r}
+s2 <- fviz_eig(pca_w2, addlabels = TRUE,
+  title = "Window 2 (After Case 1-2)"
+  ) + theme_minimal()
+```
+
+```{r}
+s3 <- fviz_eig(pca_w3, addlabels = TRUE,
+  title = "Window 3 (After Case 1-3)"
+) + theme_minimal()
+```
+
+```{r}
+s4 <- fviz_eig(pca_w4, addlabels = TRUE,
+  title = "Window 4 (After Case 1-4)"
+  ) + theme_minimal()
+```
+
+#### Plot all scree plots
+
+```{r}
+grid.arrange(s1, s2, s3, s4,
+             nrow = 2)
+```
+
+### Loadings
+```{r}
+var_w1 <- get_pca_var(pca_w1)
+var_w2 <- get_pca_var(pca_w2)
+var_w3 <- get_pca_var(pca_w3)
+var_w4 <- get_pca_var(pca_w4)
+```
+
+#### Window 1 Loadings
+
+```{r}
+var_w1$coord[,-4]
+```
+
+```{r}
+t(var_w1$coord) |> 
+  as_tibble(rownames = "NA") |> 
+  rename(dimension = `NA`) |> 
+  pivot_longer(cols = -starts_with("dimension"),
+               names_to = "variable",
+               values_to = "value") |> 
+  mutate(importance = value * value,
+         dimension = as.factor(dimension)) |> 
+  group_by(dimension) %>%
+  ungroup() %>%
+  mutate(dimension = as.factor(dimension),
+         variable = reorder_within(variable,
+                                   by = value,
+                                   within = dimension)) %>%	
+  filter(dimension == "Dim.1" | dimension == "Dim.2" | dimension == "Dim.3") |>
+  ggplot() +
+  geom_col(aes(y = value,
+             x = variable,
+             fill = value < 0)) +
+  facet_wrap(~ dimension,
+           nrow = 3,
+           scales = "free_y") +
+  guides(fill = "none") +
+  scale_x_reordered() +
+  coord_flip() +
+  guides(fill = "none")
+```
+
+#### Window 2 Loadings
+```{r}
+var_w2$coord[,-5]
+```
+
+```{r}
+t(var_w2$coord) |> 
+  as_tibble(rownames = "NA") |> 
+  rename(dimension = `NA`) |> 
+  pivot_longer(cols = -starts_with("dimension"),
+               names_to = "variable",
+               values_to = "value") |> 
+  mutate(importance = value * value,
+         dimension = as.factor(dimension)) |> 
+  group_by(dimension) %>%
+  #slice_max(importance, n = 3) %>%
+  ungroup() %>%
+  mutate(dimension = as.factor(dimension),
+         variable = reorder_within(variable,
+                                   by = value,
+                                   within = dimension)) %>%	
+  filter(dimension == "Dim.1" | dimension == "Dim.2" | dimension == "Dim.3" | dimension == "Dim.4") |>
+  ggplot() +
+  geom_col(aes(y = value,
+             x = variable,
+             fill = value < 0)) +
+  facet_wrap(~ dimension,
+           nrow = 3,
+           scales = "free_y") +
+  guides(fill = "none") +
+  scale_x_reordered() +
+  coord_flip() +
+  guides(fill = "none")
+```
+
+#### Wind 3 Loadings
+```{r}
+var_w3$coord[,-5]
+```
+
+```{r}
+t(var_w3$coord) |> 
+  as_tibble(rownames = "NA") |> 
+  rename(dimension = `NA`) |> 
+  pivot_longer(cols = -starts_with("dimension"),
+               names_to = "variable",
+               values_to = "value") |> 
+  mutate(importance = value * value,
+         dimension = as.factor(dimension)) |> 
+  group_by(dimension) %>%
+  #slice_max(importance, n = 3) %>%
+  ungroup() %>%
+  mutate(dimension = as.factor(dimension),
+         variable = reorder_within(variable,
+                                   by = value,
+                                   within = dimension)) %>%	
+  filter(dimension == "Dim.1" | dimension == "Dim.2" | dimension == "Dim.3" | dimension == "Dim.4") |>
+  ggplot() +
+  geom_col(aes(y = value,
+             x = variable,
+             fill = value < 0)) +
+  facet_wrap(~ dimension,
+           nrow = 3,
+           scales = "free_y") +
+  guides(fill = "none") +
+  scale_x_reordered() +
+  coord_flip() +
+  guides(fill = "none")
+
+```
+
+
+#### Window 4 Loadings
+```{r}
+var_w4$coord[,-5]
+```
+
+```{r}
+t(var_w4$coord) |> 
+  as_tibble(rownames = "NA") |> 
+  rename(dimension = `NA`) |> 
+  pivot_longer(cols = -starts_with("dimension"),
+               names_to = "variable",
+               values_to = "value") |> 
+  mutate(importance = value * value,
+         dimension = as.factor(dimension)) |> 
+  group_by(dimension) %>%
+  #slice_max(importance, n = 3) %>%
+  ungroup() %>%
+  mutate(dimension = as.factor(dimension),
+         variable = reorder_within(variable,
+                                   by = value,
+                                   within = dimension)) %>%	
+  filter(dimension == "Dim.1" | dimension == "Dim.2" | dimension == "Dim.3" | dimension == "Dim.4") |>
+  ggplot() +
+  geom_col(aes(y = value,
+             x = variable,
+             fill = value < 0)) +
+  facet_wrap(~ dimension,
+           nrow = 3,
+           scales = "free_y") +
+  guides(fill = "none") +
+  scale_x_reordered() +
+  coord_flip() +
+  guides(fill = "none")
+
+```
+
+### Plot correlations
+```{r}
+corrplot(var_w1$cor, tl.col = "black", method = "color")
+```
+
+```{r}
+corrplot(var_w2$cor, tl.col = "black", method = "color")
+```
+
+```{r}
+corrplot(var_w3$cor, tl.col = "black", method = "color")
+```
+
+```{r}
+corrplot(var_w4$cor, tl.col = "black", method = "color")
+```
+
+### Cos2 to see how well a variable represents a dimension
+
+#### Cos2 for Window 1
+```{r}
+var_w1$cos2[,-4]
+```
+
+```{r}
+corrplot(var_w1$cos2[,-4], 
+         is.corr = FALSE, 
+         tl.col = "black", 
+         method = "color")
+```
+
+#### Cos2 for Window 2
+```{r}
+var_w2$cos2[,-5]
+```
+
+```{r}
+corrplot(var_w2$cos2[,-5], 
+         is.corr = FALSE, 
+         tl.col = "black", 
+         method = "color")
+```
+
+#### Cos2 for Window 3
+```{r}
+var_w3$cos2[,-5]
+```
+
+```{r}
+corrplot(var_w3$cos2[,-5], 
+         is.corr = FALSE, 
+         tl.col = "black", 
+         method = "color")
+```
+
+##### Cos2 for Window 4
+```{r}
+var_w4$cos2[,-5]
+```
+
+```{r}
+corrplot(var_w4$cos2[,-5], 
+         is.corr = FALSE, 
+         tl.col = "black", 
+         method = "color")
+```
+
+### Plot Cos2
+#### Plot Cos2 for Window 1
+```{r}
+fviz_pca_var(pca_w1, col.var = "cos2",
+             gradient.cols = c("forestgreen", "orange", "red"))
+```
+
+#### Plot Cos2 for Window 2
+```{r}
+fviz_pca_var(pca_w2, col.var = "cos2",
+             gradient.cols = c("forestgreen", "orange", "red"))
+```
+
+#### Plot Cos2 for Window 3
+```{r}
+fviz_pca_var(pca_w3, col.var = "cos2",
+             gradient.cols = c("forestgreen", "orange", "red"))
+```
+
+### Plot for Cos2 for Window 4
+```{r}
+fviz_pca_var(pca_w4, col.var = "cos2",
+             gradient.cols = c("forestgreen", "orange", "red"))
+```
+
+### Contributions
+#### Window 1 Contributions via bar plot
+```{r}
+var_w1$contrib[,-4]
+```
+
+```{r}
+w1_d1 <- fviz_contrib(pca_w1, choice = "var", axes = 1, title = "D1")
+w1_d2 <- fviz_contrib(pca_w1, choice = "var", axes = 2, title = "D2")
+w1_d3 <- fviz_contrib(pca_w1, choice = "var", axes = 3, title = "D3")
+
+grid.arrange(w1_d1, w1_d2, w1_d3, nrow = 2,  
+             top = ("Contributions by dimension"))
+```
+
+#### Window 2 Contributions via bar plot
+```{r}
+var_w2$contrib[,-5]
+```
+
+```{r}
+w2_d1 <- fviz_contrib(pca_w2, choice = "var", axes = 1, title = "D1")
+w2_d2 <- fviz_contrib(pca_w2, choice = "var", axes = 2, title = "D2")
+w2_d3 <- fviz_contrib(pca_w2, choice = "var", axes = 3, title = "D3")
+w2_d4 <- fviz_contrib(pca_w2, choice = "var", axes = 4, title = "D4")
+
+grid.arrange(w2_d1, w2_d2, w2_d3, w2_d4,  nrow = 2,  
+             top = ("Contributions by dimension"))
+```
+
+#### Window 3 Contributions via bar plot
+```{r}
+var_w3$contrib[,-5]
+```
+
+```{r}
+w3_d1 <- fviz_contrib(pca_w3, choice = "var", axes = 1, title = "D1")
+w3_d2 <- fviz_contrib(pca_w3, choice = "var", axes = 2, title = "D2")
+w3_d3 <- fviz_contrib(pca_w3, choice = "var", axes = 3, title = "D3")
+w3_d4 <- fviz_contrib(pca_w3, choice = "var", axes = 4, title = "D4")
+
+grid.arrange(w3_d1, w3_d2, w3_d3, w3_d4,  nrow = 2,  
+             top = ("Contributions by dimension"))
+```
+
+#### Window 4 Contributions via bar plot
+```{r}
+var_w4$contrib[,-5]
+```
+
+```{r}
+w4_d1 <- fviz_contrib(pca_w4, choice = "var", axes = 1, title = "D1")
+w4_d2 <- fviz_contrib(pca_w4, choice = "var", axes = 2, title = "D2")
+w4_d3 <- fviz_contrib(pca_w4, choice = "var", axes = 3, title = "D3")
+w4_d4 <- fviz_contrib(pca_w4, choice = "var", axes = 4, title = "D4")
+
+grid.arrange(w4_d1, w4_d2, w4_d3, w4_d4, nrow = 2,  
+             top = ("Contributions by dimension"))
+```
+
+
+## K-means clustering
+
+```{r}
+# Window 1: From PCA, 3 retained dimensions
+pca_dims_w1 <- as.data.frame(pca_w1$ind$coord[, 1:3])
+colnames(pca_dims_w1) <- c("dim1", "dim2", "dim3")
+
+# Window 2: From PCA, 4 retained dimensions
+pca_dims_w2 <- as.data.frame(pca_w2$ind$coord[, 1:4])
+colnames(pca_dims_w2) <- c("dim1", "dim2", "dim3", "dim4")
+
+# Window 3: From PCA, 4 retained dimensions
+pca_dims_w3 <- as.data.frame(pca_w3$ind$coord[, 1:4])
+colnames(pca_dims_w3) <- c("dim1", "dim2", "dim3", "dim4")
+
+# Window 4: From PCA, 4 retained dimensions
+pca_dims_w4 <- as.data.frame(pca_w4$ind$coord[, 1:4])
+colnames(pca_dims_w4) <- c("dim1", "dim2", "dim3", "dim4")
+```
+
+### Elbow Plots
+#### Window 1 Elbow Plot
+```{r}
+set.seed(1234)
+
+# Run k-means for each value of k separately due to packages issues
+km_w1_k2  <- kmeans(pca_dims_w1, centers = 2,  nstart = 25, iter.max = 100)
+km_w1_k3  <- kmeans(pca_dims_w1, centers = 3,  nstart = 25, iter.max = 100)
+km_w1_k4  <- kmeans(pca_dims_w1, centers = 4,  nstart = 25, iter.max = 100)
+km_w1_k5  <- kmeans(pca_dims_w1, centers = 5,  nstart = 25, iter.max = 100)
+km_w1_k6  <- kmeans(pca_dims_w1, centers = 6,  nstart = 25, iter.max = 100)
+km_w1_k7  <- kmeans(pca_dims_w1, centers = 7,  nstart = 25, iter.max = 100)
+km_w1_k8  <- kmeans(pca_dims_w1, centers = 8,  nstart = 25, iter.max = 100)
+km_w1_k9  <- kmeans(pca_dims_w1, centers = 9,  nstart = 25, iter.max = 100)
+km_w1_k10 <- kmeans(pca_dims_w1, centers = 10, nstart = 25, iter.max = 100)
+
+# Manually building a dataframe with k and total within-cluster sum of squares
+elbow_w1 <- tibble(
+  k   = c(2, 3, 4, 5, 6, 7, 8, 9, 10),
+  wss = c(
+    km_w1_k2$tot.withinss,
+    km_w1_k3$tot.withinss,
+    km_w1_k4$tot.withinss,
+    km_w1_k5$tot.withinss,
+    km_w1_k6$tot.withinss,
+    km_w1_k7$tot.withinss,
+    km_w1_k8$tot.withinss,
+    km_w1_k9$tot.withinss,
+    km_w1_k10$tot.withinss
+  )
+)
+
+p1 <- ggplot(elbow_w1, aes(x = k, y = wss)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Elbow Plot: Window 1",
+       x     = "Number of clusters (k)",
+       y     = "Total within-cluster sum of squares") +
+  theme_minimal()
+```
+
+#### Window 2 Elbow Plot
+```{r}
+set.seed(1234)
+
+km_w2_k2  <- kmeans(pca_dims_w2, centers = 2,  nstart = 25, iter.max = 100)
+km_w2_k3  <- kmeans(pca_dims_w2, centers = 3,  nstart = 25, iter.max = 100)
+km_w2_k4  <- kmeans(pca_dims_w2, centers = 4,  nstart = 25, iter.max = 100)
+km_w2_k5  <- kmeans(pca_dims_w2, centers = 5,  nstart = 25, iter.max = 100)
+km_w2_k6  <- kmeans(pca_dims_w2, centers = 6,  nstart = 25, iter.max = 100)
+km_w2_k7  <- kmeans(pca_dims_w2, centers = 7,  nstart = 25, iter.max = 100)
+km_w2_k8  <- kmeans(pca_dims_w2, centers = 8,  nstart = 25, iter.max = 100)
+km_w2_k9  <- kmeans(pca_dims_w2, centers = 9,  nstart = 25, iter.max = 100)
+km_w2_k10 <- kmeans(pca_dims_w2, centers = 10, nstart = 25, iter.max = 100)
+
+elbow_w2 <- tibble(
+  k   = c(2, 3, 4, 5, 6, 7, 8, 9, 10),
+  wss = c(
+    km_w2_k2$tot.withinss,
+    km_w2_k3$tot.withinss,
+    km_w2_k4$tot.withinss,
+    km_w2_k5$tot.withinss,
+    km_w2_k6$tot.withinss,
+    km_w2_k7$tot.withinss,
+    km_w2_k8$tot.withinss,
+    km_w2_k9$tot.withinss,
+    km_w2_k10$tot.withinss
+  )
+)
+
+p2 <- ggplot(elbow_w2, aes(x = k, y = wss)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Elbow Plot: Window 2",
+       x     = "Number of clusters (k)",
+       y     = "Total within-cluster sum of squares") +
+  theme_minimal()
+```
+
+#### Window 3 Elbow Plot
+```{r} 
+set.seed(1234)
+
+km_w3_k2  <- kmeans(pca_dims_w3, centers = 2,  nstart = 25, iter.max = 100)
+km_w3_k3  <- kmeans(pca_dims_w3, centers = 3,  nstart = 25, iter.max = 100)
+km_w3_k4  <- kmeans(pca_dims_w3, centers = 4,  nstart = 25, iter.max = 100)
+km_w3_k5  <- kmeans(pca_dims_w3, centers = 5,  nstart = 25, iter.max = 100)
+km_w3_k6  <- kmeans(pca_dims_w3, centers = 6,  nstart = 25, iter.max = 100)
+km_w3_k7  <- kmeans(pca_dims_w3, centers = 7,  nstart = 25, iter.max = 100)
+km_w3_k8  <- kmeans(pca_dims_w3, centers = 8,  nstart = 25, iter.max = 100)
+km_w3_k9  <- kmeans(pca_dims_w3, centers = 9,  nstart = 25, iter.max = 100)
+km_w3_k10 <- kmeans(pca_dims_w3, centers = 10, nstart = 25, iter.max = 100)
+
+elbow_w3 <- tibble(
+  k   = c(2, 3, 4, 5, 6, 7, 8, 9, 10),
+  wss = c(
+    km_w3_k2$tot.withinss,
+    km_w3_k3$tot.withinss,
+    km_w3_k4$tot.withinss,
+    km_w3_k5$tot.withinss,
+    km_w3_k6$tot.withinss,
+    km_w3_k7$tot.withinss,
+    km_w3_k8$tot.withinss,
+    km_w3_k9$tot.withinss,
+    km_w3_k10$tot.withinss
+  )
+)
+
+p3 <- ggplot(elbow_w3, aes(x = k, y = wss)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Elbow Plot: Window 3",
+       x     = "Number of clusters (k)",
+       y     = "Total within-cluster sum of squares") +
+  theme_minimal()
+```
+
+#### Window 4 Elbow Plot
+```{r}
+set.seed(1234)
+
+km_w4_k2  <- kmeans(pca_dims_w4, centers = 2,  nstart = 25, iter.max = 100)
+km_w4_k3  <- kmeans(pca_dims_w4, centers = 3,  nstart = 25, iter.max = 100)
+km_w4_k4  <- kmeans(pca_dims_w4, centers = 4,  nstart = 25, iter.max = 100)
+km_w4_k5  <- kmeans(pca_dims_w4, centers = 5,  nstart = 25, iter.max = 100)
+km_w4_k6  <- kmeans(pca_dims_w4, centers = 6,  nstart = 25, iter.max = 100)
+km_w4_k7  <- kmeans(pca_dims_w4, centers = 7,  nstart = 25, iter.max = 100)
+km_w4_k8  <- kmeans(pca_dims_w4, centers = 8,  nstart = 25, iter.max = 100)
+km_w4_k9  <- kmeans(pca_dims_w4, centers = 9,  nstart = 25, iter.max = 100)
+km_w4_k10 <- kmeans(pca_dims_w4, centers = 10, nstart = 25, iter.max = 100)
+
+elbow_w4 <- tibble(
+  k   = c(2, 3, 4, 5, 6, 7, 8, 9, 10),
+  wss = c(
+    km_w4_k2$tot.withinss,
+    km_w4_k3$tot.withinss,
+    km_w4_k4$tot.withinss,
+    km_w4_k5$tot.withinss,
+    km_w4_k6$tot.withinss,
+    km_w4_k7$tot.withinss,
+    km_w4_k8$tot.withinss,
+    km_w4_k9$tot.withinss,
+    km_w4_k10$tot.withinss
+  )
+)
+
+p4 <- ggplot(elbow_w4, aes(x = k, y = wss)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Elbow Plot: Window 4",
+       x     = "Number of clusters (k)",
+       y     = "Total within-cluster sum of squares") +
+  theme_minimal()
+```
+
+#### All 4 plots in 1 figure
+
+```{r}
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+
+### Running K-Means Model
+```{r}
+set.seed(1234)
+
+# Window 1
+final_clusters_w1 <- kmeans(pca_dims_w1, 
+                            centers = 4,
+                            nstart = 25,
+                            iter.max = 20)
+  
+# Window 2
+final_clusters_w2 <- kmeans(pca_dims_w2, 
+                            centers = 3,
+                            nstart = 25,
+                            iter.max = 20)
+
+# Window 3
+final_clusters_w3 <- kmeans(pca_dims_w3, 
+                            centers = 4,
+                            nstart = 25,
+                            iter.max = 20)  
+
+# Window 4
+final_clusters_w4 <- kmeans(pca_dims_w4,
+                            centers = 4,
+                            nstart = 25,
+                            iter.max = 100)
+```
+
+
+### Adding cluster assignments back to each window dataset as columns
+#### Window 1
+```{r}
+pca_dims_w1 <- pca_dims_w1 |>
+  mutate(cluster = as.factor(final_clusters_w1$cluster))
+
+window1_data <- window1_data |> 
+  mutate(cluster = as.factor(final_clusters_w1$cluster))
+```
+
+#### Window 2
+```{r}
+pca_dims_w2 <- pca_dims_w2 |>
+  mutate(cluster = as.factor(final_clusters_w2$cluster))
+
+window2_data <- window2_data |> 
+  mutate(cluster = as.factor(final_clusters_w2$cluster))
+```
+
+#### Window 3
+```{r}
+pca_dims_w3 <- pca_dims_w3 |>
+  mutate(cluster = as.factor(final_clusters_w3$cluster))
+
+window3_data <- window3_data |> 
+  mutate(cluster = as.factor(final_clusters_w3$cluster))
+```
+
+#### Window 4
+```{r}
+pca_dims_w4 <- pca_dims_w4 |>
+  mutate(cluster = as.factor(final_clusters_w4$cluster))
+
+window4_data <- window4_data |> 
+  mutate(cluster = as.factor(final_clusters_w4$cluster))
+```
+
+### Confusion table to show how are at-risk students distributed across clusters
+#### Window 1
+```{r}
+table(cluster = window1_data$cluster,
+      at_risk  = window1_data$at_risk)
+```
+
+#### Window 2
+```{r}
+table(cluster = window2_data$cluster,
+      at_risk  = window2_data$at_risk)
+```
+
+#### Window 3
+```{r}
+table(cluster = window3_data$cluster,
+      at_risk  = window3_data$at_risk)
+```
+
+#### Window 4
+```{r}
+table(cluster = window4_data$cluster,
+      at_risk  = window4_data$at_risk)
+```
+
+### Summary of each cluster by its average features
+#### Window 1
+```{r}
+window1_data |>
+  group_by(cluster) |>
+  summarise(
+    n_students      = n(),
+    pct_at_risk     = round(mean(at_risk, na.rm = TRUE), 3),
+    avg_score_c1    = round(mean(score_pct_case_c1, na.rm = TRUE), 3),
+    avg_messages_c1 = round(mean(student_messages_case_c1, na.rm = TRUE), 1),
+    avg_seconds_c1  = round(mean(conversation_seconds_case_c1, na.rm = TRUE), 1),
+    avg_attempted_c1 = round(mean(attempted_case_c1, na.rm = TRUE), 3)
+  ) |>
+  arrange(desc(pct_at_risk)) |>
+  print(width = Inf)
+```
+
+#### Window 2
+```{r}
+window2_data |>
+  group_by(cluster) |>
+  summarise(
+    n_students       = n(),
+    pct_at_risk      = round(mean(at_risk, na.rm = TRUE), 3),
+    avg_score_c1     = round(mean(score_pct_case_c1, na.rm = TRUE), 3),
+    avg_messages_c1  = round(mean(student_messages_case_c1, na.rm = TRUE), 1),
+    avg_seconds_c1   = round(mean(conversation_seconds_case_c1, na.rm = TRUE), 1),
+    avg_attempted_c1 = round(mean(attempted_case_c1, na.rm = TRUE), 3),
+    avg_score_c2     = round(mean(score_pct_case_c2, na.rm = TRUE), 3),
+    avg_messages_c2  = round(mean(student_messages_case_c2, na.rm = TRUE), 1),
+    avg_seconds_c2   = round(mean(conversation_seconds_case_c2, na.rm = TRUE), 1),
+    avg_attempted_c2 = round(mean(attempted_case_c2, na.rm = TRUE), 3)
+  ) |>
+  arrange(desc(pct_at_risk)) |>
+  print(width = Inf)
+```
+
+#### Window 3
+```{r}
+window3_data |>
+  group_by(cluster) |>
+  summarise(
+    n_students       = n(),
+    pct_at_risk      = round(mean(at_risk, na.rm = TRUE), 3),
+    avg_score_c1     = round(mean(score_pct_case_c1, na.rm = TRUE), 3),
+    avg_messages_c1  = round(mean(student_messages_case_c1, na.rm = TRUE), 1),
+    avg_seconds_c1   = round(mean(conversation_seconds_case_c1, na.rm = TRUE), 1),
+    avg_attempted_c1 = round(mean(attempted_case_c1, na.rm = TRUE), 3),
+    avg_score_c2     = round(mean(score_pct_case_c2, na.rm = TRUE), 3),
+    avg_messages_c2  = round(mean(student_messages_case_c2, na.rm = TRUE), 1),
+    avg_seconds_c2   = round(mean(conversation_seconds_case_c2, na.rm = TRUE), 1),
+    avg_attempted_c2 = round(mean(attempted_case_c2, na.rm = TRUE), 3),
+    avg_score_c3     = round(mean(score_pct_case_c3, na.rm = TRUE), 3),
+    avg_messages_c3  = round(mean(student_messages_case_c3, na.rm = TRUE), 1),
+    avg_seconds_c3   = round(mean(conversation_seconds_case_c3, na.rm = TRUE), 1),
+    avg_attempted_c3 = round(mean(attempted_case_c3, na.rm = TRUE), 3)
+  ) |>
+  arrange(desc(pct_at_risk)) |>
+  print(width = Inf)
+```
+
+#### Window 4
+```{r}
+window4_data |>
+  group_by(cluster) |>
+  summarise(
+    n_students       = n(),
+    pct_at_risk      = round(mean(at_risk, na.rm = TRUE), 3),
+    avg_score_c1     = round(mean(score_pct_case_c1, na.rm = TRUE), 3),
+    avg_messages_c1  = round(mean(student_messages_case_c1, na.rm = TRUE), 1),
+    avg_seconds_c1   = round(mean(conversation_seconds_case_c1, na.rm = TRUE), 1),
+    avg_attempted_c1 = round(mean(attempted_case_c1, na.rm = TRUE), 3),
+    avg_score_c2     = round(mean(score_pct_case_c2, na.rm = TRUE), 3),
+    avg_messages_c2  = round(mean(student_messages_case_c2, na.rm = TRUE), 1),
+    avg_seconds_c2   = round(mean(conversation_seconds_case_c2, na.rm = TRUE), 1),
+    avg_attempted_c2 = round(mean(attempted_case_c2, na.rm = TRUE), 3),
+    avg_score_c3     = round(mean(score_pct_case_c3, na.rm = TRUE), 3),
+    avg_messages_c3  = round(mean(student_messages_case_c3, na.rm = TRUE), 1),
+    avg_seconds_c3   = round(mean(conversation_seconds_case_c3, na.rm = TRUE), 1),
+    avg_attempted_c3 = round(mean(attempted_case_c3, na.rm = TRUE), 3),
+    avg_score_c4     = round(mean(score_pct_case_c4, na.rm = TRUE), 3),
+    avg_attempted_c4 = round(mean(attempted_case_c4, na.rm = TRUE), 3)
+  ) |>
+  arrange(desc(pct_at_risk)) |>
+  print(width = Inf)
+```
+
+
+### Visualizing clusters colored by at-risk status
+#### Window 1: 4 clusters
+```{r}
+pca_dims_w1 <- pca_dims_w1 |>
+  mutate(
+    cluster_label = case_when(
+      cluster == "1" ~ "Cluster 1: Moderate Risk, High Engagers",
+      cluster == "2" ~ "Cluster 2: Moderate Risk, Non-Attempters",
+      cluster == "3" ~ "Cluster 3: Highest Risk, Moderate Engagers",
+      cluster == "4" ~ "Cluster 4: Lowest Risk, Rapid Messagers"
+    )
+  )
+
+ggplot(pca_dims_w1, aes(x = dim1, y = dim2,
+             color = cluster_label, fill = cluster_label,
+             shape = as.factor(window1_data$at_risk))) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  stat_ellipse(aes(group = cluster_label), type = "norm",
+               geom = "polygon", alpha = 0.1, linetype = "dashed") +
+  scale_shape_manual(name = "At-Risk",
+                     values = c("0" = 16, "1" = 17),
+                     labels = c("0" = "Not At-Risk", "1" = "At-Risk")) +
+  labs(title = "Cluster Plot: Window 1",
+       x = paste0("Dim 1 (", round(pca_w1$eig[1, 2], 1), "%)"),
+       y = paste0("Dim 2 (", round(pca_w1$eig[2, 2], 1), "%)")) +
+  theme_minimal()
+```
+
+#### Window 2: 3 clusters
+```{r}
+pca_dims_w2 <- pca_dims_w2 |>
+  mutate(
+    cluster_label = case_when(
+      cluster == "1" ~ "Cluster 1: Moderate Risk, Case 1 Skippers",
+      cluster == "2" ~ "Cluster 2: Highest Risk, Case 2 Skippers",
+      cluster == "3" ~ "Cluster 3: Lowest Risk, Consistent Performers"
+    )
+  )
+
+ggplot(pca_dims_w2, aes(x = dim1, y = dim2,
+             color = cluster_label, fill = cluster_label,
+             shape = as.factor(window2_data$at_risk))) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  stat_ellipse(aes(group = cluster_label), type = "norm",
+               geom = "polygon", alpha = 0.1, linetype = "dashed") +
+  scale_shape_manual(name = "At-Risk",
+                     values = c("0" = 16, "1" = 17),
+                     labels = c("0" = "Not At-Risk", "1" = "At-Risk")) +
+  labs(title = "Cluster Plot: Window 2",
+       x = paste0("Dim 1 (", round(pca_w2$eig[1, 2], 1), "%)"),
+       y = paste0("Dim 2 (", round(pca_w2$eig[2, 2], 1), "%)")) +
+  theme_minimal()
+```
+
+#### Window 3: 4 clusters
+```{r}
+pca_dims_w3 <- pca_dims_w3 |>
+  mutate(
+    cluster_label = case_when(
+      cluster == "1" ~ "Cluster 1: Moderate Risk, Case 1 Skippers",
+      cluster == "2" ~ "Cluster 2: Highest Risk, Case 3 Skippers",
+      cluster == "3" ~ "Cluster 3: Moderate Risk, Case 2 Skippers",
+      cluster == "4" ~ "Cluster 4: Lowest Risk, Consistent Performers"
+    )
+  )
+
+ggplot(pca_dims_w3, aes(x = dim1, y = dim2,
+             color = cluster_label, fill = cluster_label,
+             shape = as.factor(window3_data$at_risk))) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  stat_ellipse(aes(group = cluster_label), type = "norm",
+               geom = "polygon", alpha = 0.1, linetype = "dashed") +
+  scale_shape_manual(name = "At-Risk",
+                     values = c("0" = 16, "1" = 17),
+                     labels = c("0" = "Not At-Risk", "1" = "At-Risk")) +
+  labs(title = "Cluster Plot: Window 3",
+       x = paste0("Dim 1 (", round(pca_w3$eig[1, 2], 1), "%)"),
+       y = paste0("Dim 2 (", round(pca_w3$eig[2, 2], 1), "%)")) +
+  theme_minimal()
+```
+
+#### Window 4: 4 clusters
+```{r}
+pca_dims_w4 <- pca_dims_w4 |>
+  mutate(
+    cluster_label = case_when(
+      cluster == "1" ~ "Cluster 1: Highest Risk, Case 3 Skippers",
+      cluster == "2" ~ "Cluster 2: Moderate Risk, Case 2 Skippers",
+      cluster == "3" ~ "Cluster 3: Moderate Risk, Case 1 Skippers",
+      cluster == "4" ~ "Cluster 4: Lowest Risk, Consistent Performers"
+    )
+  )
+
+ggplot(pca_dims_w4, aes(x = dim1, y = dim2,
+             color = cluster_label, fill = cluster_label,
+             shape = as.factor(window4_data$at_risk))) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  stat_ellipse(aes(group = cluster_label), type = "norm",
+               geom = "polygon", alpha = 0.1, linetype = "dashed") +
+  scale_shape_manual(name = "At-Risk",
+                     values = c("0" = 16, "1" = 17),
+                     labels = c("0" = "Not At-Risk", "1" = "At-Risk")) +
+  labs(title = "Cluster Plot: Window 4",
+       x = paste0("Dim 1 (", round(pca_w4$eig[1, 2], 1), "%)"),
+       y = paste0("Dim 2 (", round(pca_w4$eig[2, 2], 1), "%)")) +
+  theme_minimal()
+```
+
+
