@@ -1,0 +1,567 @@
+# **Predictive models**
+
+```{r}
+#I'll open the database first and save in the environment
+student_wide <- read_csv("/Users/marcosrojas/Documents/GitHub/423B_Project/output/student_wide.csv", show_col_types = FALSE)
+```
+
+```{r}
+#Now I'll check the database again to make sure I understand variables and think about new variables I could create, as well as plan the analysis
+glimpse(student_wide)
+
+```
+
+```{r}
+#I will create the outcome variable for low performance first in case 8
+#I only keep students with an observed Case 8 score
+analysis_data <- student_wide |>
+  filter(!is.na(score_pct_case_c8))
+
+#Bottom 20% cutoff for Case 8 performance
+cutoff_case8 <- quantile(analysis_data$score_pct_case_c8,
+                         probs = 0.20,
+                         na.rm = TRUE)
+
+#Binary outcome: Yes = student is in the bottom 20% on Case 8
+analysis_data <- analysis_data |>
+  mutate(
+    low_perf_c8 = if_else(score_pct_case_c8 <= cutoff_case8, "Yes", "No"),
+    low_perf_c8 = factor(low_perf_c8, levels = c("No", "Yes")))
+
+#I'll check the prevalence of the outcome
+mean(analysis_data$low_perf_c8 == "Yes")
+table(analysis_data$low_perf_c8)
+```
+
+```{r}
+#to create the new predictors in the database
+#I'll use some functions because we'll use certain windows
+#of data, like from case 1 to 3 so we can make this early prediction model
+
+#also, we need new variables as the variables in the dataset are not
+#fully independent
+
+#function to obtain the last observed score of a student
+last_observed_fn <- function(x) {
+  vals <- x[!is.na(x)]
+  if (length(vals) == 0) return(NA_real_)
+  vals[length(vals)]
+}
+
+#function to see if the scores of the student go up or down
+score_slope_fn <- function(x) {
+  idx <- which(!is.na(x))
+  vals <- x[idx]
+  if (length(vals) < 2) return(NA_real_)
+  coef(lm(vals ~ idx))[2]
+}
+
+#function to compute the difference in recent scores
+recent_change_fn <- function(x) {
+  vals <- x[!is.na(x)]
+  if (length(vals) < 2) return(NA_real_)
+  vals[length(vals)] - vals[length(vals) - 1]
+}
+
+#now we'll create the window data depending on how many cases
+#we want to consider as the early performance
+#I'm not sure if we want the first 3 or 5 so with a function
+#we can change this later
+make_window_data <- function(data, last_case) {
+  score_vars   <- paste0("score_pct_case_c", 1:last_case)
+  attempt_vars <- paste0("attempted_case_c", 1:last_case)
+
+  #this is to not consider cases with no conversation with patient
+  enabled_cases <- intersect(1:last_case, c(1, 2, 3, 6, 7, 8))
+  msg_vars  <- paste0("student_messages_case_c", enabled_cases)
+  time_vars <- paste0("conversation_seconds_case_c", enabled_cases)
+
+  #this creates the attempt variables only for conversation-enabled cases
+  attempt_conv_vars <- paste0("attempted_case_c", enabled_cases)
+
+  #now we can keep all variables of the cases as matrices
+  score_mat   <- as.matrix(data[, score_vars])
+  attempt_mat <- as.matrix(data[, attempt_vars])
+  msg_mat     <- as.matrix(data[, msg_vars, drop = FALSE])
+  time_mat    <- as.matrix(data[, time_vars, drop = FALSE])
+  attempt_conv_mat <- as.matrix(data[, attempt_conv_vars, drop = FALSE])
+
+  #number of conversation-enabled cases actually attempted
+  attempted_conv_cases <- rowSums(attempt_conv_mat, na.rm = TRUE)
+
+  #now the output which is a tibble with student ID and the outcome
+  #which is the new variable low_perf_c8 classification
+  out <- tibble(
+    student_id = data$student_id,
+    low_perf_c8 = data$low_perf_c8,
+
+    #attempt summary to know how many cases are in the window
+    #so we know participation of the student in the class
+    attempted_total = rowSums(attempt_mat, na.rm = TRUE),
+
+    #score summaries
+    mean_score = rowMeans(score_mat, na.rm = TRUE),
+    sd_score = apply(score_mat, 1, sd, na.rm = TRUE),
+    last_observed_score = apply(score_mat, 1, last_observed_fn),
+    score_slope = apply(score_mat, 1, score_slope_fn),
+    recent_score_change = apply(score_mat, 1, recent_change_fn),
+
+    #total conversational activity up to this point
+    total_messages = rowSums(msg_mat, na.rm = TRUE),
+    total_conversation_seconds = rowSums(time_mat, na.rm = TRUE),
+
+    #number of conversation-enabled cases actually attempted
+    attempted_conv_cases = attempted_conv_cases,
+
+    #mean conversational activity conditional on attempted
+    #conversation-enabled cases only.
+    mean_messages = if_else(
+      attempted_conv_cases > 0,
+      rowSums(msg_mat, na.rm = TRUE) / attempted_conv_cases,
+      NA_real_),
+    mean_conversation_seconds = if_else(
+      attempted_conv_cases > 0,
+      rowSums(time_mat, na.rm = TRUE) / attempted_conv_cases,
+      NA_real_))
+
+  #to make sure all NAs are handled consistently
+  out <- out |>
+    mutate(across(where(is.numeric), ~ ifelse(is.nan(.x), NA_real_, .x)))
+  return(out)
+}
+```
+
+```{r}
+#this is to change the window of data if we want to
+#for now I'll use from case 1 to 4, this means
+#we'll have datasets with case 1 only, 1 to 2, 1 to 3, etc
+windows <- 1:4
+
+#now I can create a list of datasets which will be the datasets corresponding
+#to the window 1:4
+window_data_list <- setNames(
+  lapply(windows, function(k) make_window_data(analysis_data, k)),
+  paste0("after_case_", windows))
+```
+
+```{r}
+#now the code to divide the whole dataset into train and test
+#train will be 80% and test 20%
+set.seed(1234)
+split_index <- createDataPartition(analysis_data$low_perf_c8,
+                                   p = 0.80,
+                                   list = FALSE,
+                                   times = 1)
+```
+
+```{r}
+#we have missing data in some students
+#some students may have missing score-based summaries
+#I'll impute using medians from the training set only so we can have complete data
+
+#I'll use a function to do this for reproducibility
+median_impute_from_train <- function(train, test, outcome_name = "low_perf_c8") {
+  predictor_names <- setdiff(names(train), c("student_id", outcome_name))
+  for (v in predictor_names) {
+    med_v <- median(train[[v]], na.rm = TRUE)
+    if (is.na(med_v)) {
+      med_v <- 0
+    }
+    train[[v]][is.na(train[[v]])] <- med_v
+    test[[v]][is.na(test[[v]])] <- med_v
+  }
+  list(train = train, test = test)
+}
+```
+
+```{r}
+#Again, to save time in the future if we get more data or update datasets,
+#here we'll have 2 functions, one for computing performance metrics
+#and another one for modeling and testing
+
+get_metrics <- function(prob, pred, truth, model_name, threshold_used) {
+  #prob is predicted probabilities of yes
+  #pred is the predicted classes yes or no
+  #true the true observed outcome
+  #the confusion matrix needs the predicted classes and the truth
+  cm <- confusionMatrix(pred, truth, positive = "Yes")
+  tibble(
+    model = model_name,
+    threshold_used = threshold_used,
+    share_flagged = mean(pred == "Yes"), #to know how many students are flagged
+    #as at risk
+    accuracy = as.numeric(cm$overall["Accuracy"]),
+    sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    specificity = as.numeric(cm$byClass["Specificity"]),
+    precision = as.numeric(cm$byClass["Pos Pred Value"]),
+    balanced_accuracy = as.numeric(cm$byClass["Balanced Accuracy"]),
+  )
+}
+
+#function to fit models and evaluate them with the test dataset
+fit_and_evaluate_models <- function(train_df, test_df) {
+#first, we'll take out student_id to avoid issues
+  #I already tried and generated issues being present as a predictor
+  train_model <- train_df |>
+    select(-student_id)
+  test_model <- test_df |>
+    select(-student_id)
+#First model: logistic regression
+  logit_model <- glm(low_perf_c8 ~ .,
+                     data = train_model,
+                     family = binomial)
+  #now we extract the predicted probabilities instead of keeping log-odds
+  #for easier interpretation
+  prob_train_logit <- predict(logit_model, newdata = train_model, type = "response")
+  prob_test_logit  <- predict(logit_model, newdata = test_model, type = "response")
+  #the threshold will be in this case 0.80 so 20% high risk students
+  #will be flagged as yes, from the training set
+  threshold_logit <- quantile(prob_train_logit, probs = 0.80, na.rm = TRUE)
+  #now we compute in the testing dataset the class Yes No using the threshold
+  pred_test_logit <- factor(ifelse(prob_test_logit >= threshold_logit, "Yes", "No"),
+                            levels = c("No", "Yes"))
+
+#Second model: Naive Bayes
+  nb_model <- naiveBayes(low_perf_c8 ~ .,
+                         data = train_model)
+  #I'm not sure here as the assumption is independence and some of the predictors
+  #have dependencies
+  #we compute now the predicted probabilities for both datasets based on the model
+  prob_train_nb <- predict(nb_model, newdata = train_model, type = "raw")[, "Yes"]
+  prob_test_nb  <- predict(nb_model, newdata = test_model, type = "raw")[, "Yes"]
+  #now the threshold that is basically the same as the previous model
+  threshold_nb <- quantile(prob_train_nb, probs = 0.80, na.rm = TRUE)
+  #with the threshold we compute now the class yes no in the testing dataset
+  pred_test_nb <- factor(ifelse(prob_test_nb >= threshold_nb, "Yes", "No"),
+                         levels = c("No", "Yes"))
+
+#Third model: decision tree
+  set.seed(1234)
+  #we'll train with cv
+  mycontrol <- trainControl(method = "cv",
+                            number = 10,
+                            classProbs = TRUE)
+  #here's the tree
+  tree_model <- train(low_perf_c8 ~ .,
+                      data = train_model,
+                      trControl = mycontrol,
+                      method = "rpart",
+                      tuneLength = 100)
+  #now we predict probabilities in test and train data based on the tree
+  prob_train_tree <- predict(tree_model, newdata = train_model, type = "prob")[, "Yes"]
+  prob_test_tree  <- predict(tree_model, newdata = test_model, type = "prob")[, "Yes"]
+  #same threshold as before
+  threshold_tree <- quantile(prob_train_tree, probs = 0.80, na.rm = TRUE)
+  #now we predict the class based on the threshold for the testing dataset
+  pred_test_tree <- factor(ifelse(prob_test_tree >= threshold_tree, "Yes", "No"),
+                           levels = c("No", "Yes"))
+  
+  
+#finally, we put together all metrics from the models
+  metrics_tbl <- bind_rows(
+    get_metrics(prob_test_logit, pred_test_logit, test_model$low_perf_c8,
+                "logistic", threshold_logit),
+    get_metrics(prob_test_nb, pred_test_nb, test_model$low_perf_c8,
+                "naive_bayes", threshold_nb),
+    get_metrics(prob_test_tree, pred_test_tree, test_model$low_perf_c8,
+                "decision_tree", threshold_tree))
+
+  #the output database with everything for simplicity
+  out <- list(
+    models = list(
+      logistic = logit_model,
+      naive_bayes = nb_model,
+      decision_tree = tree_model),
+    predictions = list(
+      logistic = tibble(truth = test_model$low_perf_c8,
+                        prob = prob_test_logit,
+                        pred = pred_test_logit),
+      naive_bayes = tibble(truth = test_model$low_perf_c8,
+                           prob = prob_test_nb,
+                           pred = pred_test_nb),
+      decision_tree = tibble(truth = test_model$low_perf_c8,
+                             prob = prob_test_tree,
+                             pred = pred_test_tree)),
+    metrics = metrics_tbl)
+  return(out)
+}
+```
+
+```{r}
+#now, we can run the analysis for all the windows of cases in the dataset
+#empty list to store the results
+results_list <- list()
+#now the loop for all windows
+for (w in names(window_data_list)) {
+  #dataset for the window happening now
+  current_data <- window_data_list[[w]]
+  #based on the division created before to split data, we split the 
+  #data of this window into training and test
+  train_df <- current_data[split_index, ]
+  test_df  <- current_data[-split_index, ]
+  #now that we have the dataset, we do imputation for missing values
+  imputed_data <- median_impute_from_train(train_df, test_df,
+                                           outcome_name = "low_perf_c8")
+  train_df <- imputed_data$train
+  test_df  <- imputed_data$test
+  #now we run the models!
+  results_list[[w]] <- fit_and_evaluate_models(train_df, test_df)
+}
+
+#after the for loop, we put all metrics together
+all_metrics <- bind_rows(
+  lapply(names(results_list), function(w) {
+    results_list[[w]]$metrics |>
+      mutate(window = w)
+  }))|>
+  select(window, everything()) |>
+  arrange(window, desc(balanced_accuracy), desc(accuracy))
+
+all_metrics
+```
+
+```{r}
+#plot of model performance across windows using balanced accuracy
+ggplot(all_metrics,
+       aes(x = window,
+           y = balanced_accuracy,
+           color = model,
+           group = model)) +
+  geom_line() +
+  geom_point(size = 2) +
+  labs(title = "Test-set balanced accuracy across prediction windows",
+       x = "Prediction window",
+       y = "Balanced accuracy",
+       color = "Model") +
+  theme_minimal()
+```
+
+```{r}
+#decision tree plot
+#as in window 1 and 2 it collapses, also in 4, I'm using window 3 to see how it looks
+rpart.plot(results_list$after_case_3$models$decision_tree$finalModel)
+```
+
+```{r}
+#to extract the best result from the whole summary table based on 
+best_result <- all_metrics |>
+  #I'll use balanced accuracy but then also accuracy and precision
+  arrange(desc(balanced_accuracy),
+          desc(accuracy),
+          desc(precision)) |>
+  slice(1)
+best_result
+```
+
+```{r}
+#just to have this full circle, I tried to do a code that represents
+#what would happen in the real world: the instructor receives the list of 
+#students who are flagged as future low performers, so they do something about it
+#we don't have names so I'm using the student ID. I'm also using the best model
+
+#get best window and model name
+best_window <- best_result$window
+best_model  <- best_result$model
+
+#reconstruct the test dataset for that window
+best_test_df <- window_data_list[[best_window]][-split_index, ]
+
+#extract the predictions from the model
+best_predictions <- results_list[[best_window]]$predictions[[best_model]]
+
+#bind Student IDs to the prediction output
+best_test_predictions <- best_test_df |>
+  select(student_id) |>
+  bind_cols(best_predictions)
+
+#now we can get the student IDs
+flagged_student_ids <- best_test_predictions |>
+  filter(pred == "Yes") |>
+  select(student_id)
+
+flagged_student_ids
+#yay
+```
+
+```{r}
+#for research question 2 we can extract some of the best predictors for the best
+#model, but for that I'll standardize the variables so the coefficients are 
+#easier to interpret
+best_window <- best_result$window
+best_model  <- best_result$model
+
+best_window
+best_model
+
+best_data <- window_data_list[[best_window]]
+
+train_df <- best_data[split_index, ]
+test_df  <- best_data[-split_index, ]
+
+imputed_data <- median_impute_from_train(train_df, test_df,
+                                         outcome_name = "low_perf_c8")
+train_df <- imputed_data$train
+
+#no student ID in this new dataset
+train_model <- train_df |>
+  select(-student_id)
+
+#here we standardize the predictors
+predictor_names <- setdiff(names(train_model), "low_perf_c8")
+train_std <- train_model
+train_std[, predictor_names] <- scale(train_std[, predictor_names])
+
+#refit the logistic regression to then extract the coef
+#I'm using logistic regression because it was the best model for now
+logit_std <- glm(low_perf_c8 ~ .,
+                 data = train_std,
+                 family = binomial)
+coef_mat <- summary(logit_std)$coefficients
+
+coef_tbl <- tibble(
+  variable = rownames(coef_mat),
+  estimate = coef_mat[, 1],
+  std_error = coef_mat[, 2],
+  z_value = coef_mat[, 3],
+  p_value = coef_mat[, 4]
+) |>
+  filter(variable != "(Intercept)") |>
+  mutate(abs_estimate = abs(estimate)) |>
+  arrange(desc(abs_estimate))
+
+coef_tbl
+
+#top predictors, five for now
+top_predictors <- coef_tbl |>
+  slice_head(n = 5)
+top_predictors
+top_predictor_names <- top_predictors$variable
+top_predictor_names
+```
+
+Considering the results across prediction windows, I see that the more consistent model is Naive bayes and not logistic regression, so for better reproducibility in other contexts and courses, I'll prioritize Naive Bayes for research question 2 computing again the top predictors but for that model.
+
+```{r}
+model_summary <- all_metrics |>
+  group_by(model) |>
+  summarise(
+    mean_balanced_accuracy = mean(balanced_accuracy, na.rm = TRUE),
+    sd_balanced_accuracy = sd(balanced_accuracy, na.rm = TRUE),
+    mean_accuracy = mean(accuracy, na.rm = TRUE),
+    mean_precision = mean(precision, na.rm = TRUE),
+    .groups = "drop") |>
+  arrange(desc(mean_balanced_accuracy),
+          sd_balanced_accuracy,
+          desc(mean_accuracy))
+
+model_summary
+preferred_model_family <- "naive_bayes"
+```
+
+```{r}
+#this is for choosing the best window for this model
+preferred_result <- all_metrics |>
+  filter(model == preferred_model_family) |>
+  arrange(desc(balanced_accuracy),
+          desc(accuracy),
+          desc(precision)) |>
+  slice(1)
+
+preferred_result
+```
+
+```{r}
+#similar to what I did before
+predict_yes_prob <- function(model_obj, model_name, newdata) {
+  if (model_name == "logistic") {
+    predict(model_obj, newdata = newdata, type = "response")
+  } else if (model_name == "naive_bayes") {
+    predict(model_obj, newdata = newdata, type = "raw")[, "Yes"]
+  } else if (model_name == "decision_tree") {
+    predict(model_obj, newdata = newdata, type = "prob")[, "Yes"]
+  } else {
+    stop("Unknown model name")
+  }
+}
+
+balanced_acc_fn <- function(pred, truth) {
+  cm <- confusionMatrix(pred, truth, positive = "Yes")
+  as.numeric(cm$byClass["Balanced Accuracy"])
+}
+
+perm_importance <- function(model_obj, model_name, test_df, threshold,
+                            outcome_name = "low_perf_c8",
+                            n_perm = 200, seed = 1234) {
+
+  set.seed(seed)
+
+  test_model <- test_df |>
+    select(-student_id)
+
+  truth <- test_model[[outcome_name]]
+  predictor_names <- setdiff(names(test_model), outcome_name)
+
+  base_prob <- predict_yes_prob(model_obj, model_name, test_model)
+  base_pred <- factor(ifelse(base_prob >= threshold, "Yes", "No"),
+                      levels = c("No", "Yes"))
+  base_ba <- balanced_acc_fn(base_pred, truth)
+
+  importance_tbl <- lapply(predictor_names, function(v) {
+    drops <- replicate(n_perm, {
+      perm_df <- test_model
+      perm_df[[v]] <- sample(perm_df[[v]])
+
+      perm_prob <- predict_yes_prob(model_obj, model_name, perm_df)
+      perm_pred <- factor(ifelse(perm_prob >= threshold, "Yes", "No"),
+                          levels = c("No", "Yes"))
+
+      base_ba - balanced_acc_fn(perm_pred, truth)
+    })
+
+    tibble(
+      variable = v,
+      importance = mean(drops, na.rm = TRUE),
+      sd_importance = sd(drops, na.rm = TRUE)
+    )
+  }) |>
+    bind_rows() |>
+    arrange(desc(importance))
+
+  list(
+    baseline_balanced_accuracy = base_ba,
+    importance = importance_tbl
+  )
+}
+```
+
+```{r}
+#Again the same as before but now for naive bayes
+best_window <- preferred_result$window
+best_model  <- preferred_result$model
+best_threshold <- preferred_result$threshold_used
+
+best_data <- window_data_list[[best_window]]
+
+train_df <- best_data[split_index, ]
+test_df  <- best_data[-split_index, ]
+
+imputed_data <- median_impute_from_train(train_df, test_df,
+                                         outcome_name = "low_perf_c8")
+train_df <- imputed_data$train
+test_df  <- imputed_data$test
+
+best_model_obj <- results_list[[best_window]]$models[[best_model]]
+
+perm_out <- perm_importance(
+  model_obj = best_model_obj,
+  model_name = best_model,
+  test_df = test_df,
+  threshold = best_threshold,
+  n_perm = 200)
+
+top_predictors <- perm_out$importance |>
+  slice_head(n = 5)
+
+perm_out$baseline_balanced_accuracy
+top_predictors
+```

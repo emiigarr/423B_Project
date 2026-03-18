@@ -1,0 +1,281 @@
+# **Data Wrangling**
+
+## 
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(stringr)
+library(caret)
+library(e1071)
+library(rpart.plot)
+```
+
+```{r, eval=FALSE}
+data_dir <- "Data"
+
+perf_files <- c(
+  "Case 1 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762323818623.csv",
+  "Case 2 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762324066549.csv",
+  "Case 3 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762324404887.csv",
+  "Case 4 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762329552913.csv",
+  "Case 5 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762331930830.csv",
+  "Case 6 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762332005256.csv",
+  "Case 7 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762373034693.csv",
+  "Case 8 Student Performance (Questions, Rubrics, Notes, Activity Feedback)_1762372959944.csv")
+
+msg_files <- c(
+  "Case 1 messages_export_1762323926511.csv",
+  "Case 2 messages_export_1762324188309.csv",
+  "Case 3 messages_export_1762329513678.csv",
+  "Case 6 messages_export_1762332088572.csv",
+  "Case 7 messages_export_1762372921944.csv",
+  "Case 8 messages_export_1762373120016.csv")
+
+get_case_number <- function(x) {
+  str_extract(x, "(?i)case\\s*\\d+") |>
+    str_extract("\\d+") |>
+    as.integer()}
+
+read_perf <- function(fname) {
+  read_csv(
+    file.path(data_dir, fname),
+    show_col_types = FALSE,
+    col_types = cols(.default = col_character()))|>
+    clean_names() |>
+    mutate(
+      source_file = fname,
+      case_number = get_case_number(fname))}
+
+read_msgs <- function(fname) {
+  read_csv(
+    file.path(data_dir, fname),
+    show_col_types = FALSE,
+    col_types = cols(.default = col_character()))|>
+    clean_names() |>
+    mutate(
+      source_file = fname,
+      case_number = get_case_number(fname))}
+
+perf_long <- perf_files |>
+  map_dfr(read_perf)
+
+conv_long <- msg_files |>
+  map_dfr(read_msgs)
+```
+
+The conversation dataset contains 142,222 observations across 17 variables, whereas the clinical case performance dataset contains 17,119 observations across 30 variables.
+
+```{r, eval=FALSE}
+glimpse(conv_long)
+glimpse(perf_long)
+```
+
+Considering all the variables in this dataset, we'll keep the ones that identify the student only.
+
+## Data Cleaning
+
+After inspecting both long-format exports, we retained only the variables required for this project. From the performance dataset, we kept identifiers, attempt metadata, and scoring variables. From the conversation dataset, we kept identifiers, speaker role, timestamps, and conversation duration. Variables that do not vary meaningfully across students within case, or that are not needed for the current analysis, were excluded.
+
+For the performance export, total score within an attempt was defined as the sum of all non-missing values in achieved_score for that attempt_id, and total possible score was defined as the sum of all non-missing values in max_score for that same attempt. For the conversation export, we summarized each conversation by counting the number of student-authored messages (role == "user"), which we use as a proxy for interaction efficiency. We also retained conversation-level details that belong to that same attempt, including total message count, conversation duration, and start/end timestamps. These two attempt-level summaries were then merged using attempt_id.
+
+```{r, eval=FALSE}
+options(dplyr.summarise.inform = FALSE)
+
+parse_platform_time <- function(x) {
+  x|>
+    str_remove(" GMT.*$")|>
+    as.POSIXct(format = "%a %b %d %Y %H:%M:%S", tz = "UTC")}
+
+safe_chr_first <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) NA_character_ else x[1]}
+
+safe_num_first <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else x[1]}
+
+safe_num_last <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else x[length(x)]}
+
+safe_num_max <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else max(x)}
+
+safe_time_min <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) as.POSIXct(NA) else min(x, na.rm = TRUE)}
+
+safe_time_max <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) as.POSIXct(NA) else max(x, na.rm = TRUE)}
+
+perf_clean <- perf_long |>
+  select(
+    attempt_id,
+    course_clinical_activity_id,
+    response_by_id,
+    response_by_role,
+    achieved_score,
+    max_score,
+    attempt_no,
+    performed_at,
+    case_number)|>
+  mutate(
+    attempt_id = as.character(attempt_id),
+    course_clinical_activity_id = as.character(course_clinical_activity_id),
+    response_by_id = as.character(response_by_id),
+    response_by_role = toupper(as.character(response_by_role)),
+    achieved_score = as.numeric(achieved_score),
+    max_score = as.numeric(max_score),
+    attempt_no = as.numeric(attempt_no),
+    performed_at = parse_platform_time(performed_at))|>
+  filter(is.na(response_by_role) | response_by_role == "STUDENT")
+
+conv_clean <- conv_long |>
+  select(
+    attempt_id,
+    clinical_activity_id,
+    user_id,
+    role,
+    timestamp,
+    medical_history_duration,
+    case_number)|>
+  mutate(
+    attempt_id = as.character(attempt_id),
+    clinical_activity_id = as.character(clinical_activity_id),
+    user_id = as.character(user_id),
+    role = tolower(as.character(role)),
+    timestamp = parse_platform_time(timestamp),
+    medical_history_duration = as.numeric(medical_history_duration))
+
+perf_attempt <- perf_clean |>
+  group_by(attempt_id, case_number) |>
+  summarise(
+    student_id = safe_chr_first(response_by_id),
+    case_id = safe_chr_first(course_clinical_activity_id),
+    attempt_no = safe_num_first(sort(unique(na.omit(attempt_no)))),
+
+    attempt_start_ts = safe_time_min(performed_at),
+    attempt_end_ts = safe_time_max(performed_at),
+
+    points_earned_attempt = sum(achieved_score, na.rm = TRUE),
+    points_possible_attempt = sum(max_score, na.rm = TRUE),
+    score_pct_attempt = if_else(
+      points_possible_attempt > 0,
+      points_earned_attempt / points_possible_attempt,
+      NA_real_),
+    .groups = "drop")
+
+conv_attempt <- conv_clean |>
+  group_by(attempt_id, case_number) |>
+  summarise(
+    student_id = safe_chr_first(user_id),
+    case_id = safe_chr_first(clinical_activity_id),
+
+    student_messages_attempt = sum(role == "user", na.rm = TRUE),
+    total_messages_attempt = n(),
+    medical_history_duration_attempt = safe_num_max(medical_history_duration),
+
+    conversation_start_ts = safe_time_min(timestamp),
+    conversation_end_ts = safe_time_max(timestamp),
+    conversation_span_seconds = as.numeric(conversation_end_ts - conversation_start_ts),
+    .groups = "drop")
+
+conversation_enabled_tbl <- tibble(case_number = 1:8) |>
+  mutate(
+    conversation_enabled = if_else(case_number %in% c(1, 2, 3, 6, 7, 8), 1L, 0L))
+
+attempt_master <- perf_attempt |>
+  left_join(conv_attempt, by = c("attempt_id", "case_number"), suffix = c("_perf", "_conv"))|>
+  mutate(
+    student_id = coalesce(student_id_perf, student_id_conv),
+    case_id = coalesce(case_id_perf, case_id_conv))|>
+  select(
+    attempt_id,
+    case_number,
+    student_id,
+    case_id,
+    attempt_no,
+    attempt_start_ts,
+    attempt_end_ts,
+    points_earned_attempt,
+    points_possible_attempt,
+    score_pct_attempt,
+    student_messages_attempt,
+    total_messages_attempt,
+    medical_history_duration_attempt,
+    conversation_start_ts,
+    conversation_end_ts,
+    conversation_span_seconds)|>
+  left_join(conversation_enabled_tbl, by = "case_number")|>
+  mutate(
+    student_messages_attempt = if_else(conversation_enabled == 0, 0L, coalesce(student_messages_attempt, 0L)),
+    total_messages_attempt = if_else(conversation_enabled == 0, 0L, coalesce(total_messages_attempt, 0L)),
+    medical_history_duration_attempt = if_else(conversation_enabled == 0, 0, coalesce(medical_history_duration_attempt, 0)),
+    conversation_span_seconds = if_else(conversation_enabled == 0, 0, coalesce(conversation_span_seconds, 0)))
+```
+
+## Data wrangling
+
+Because each student completed only one attempt per case, the merged attempt-level dataset could be used directly to construct the final student-level analytic file. At this stage, we retained the variables most relevant to the present project: whether the student attempted the case, the total points earned in that case, a standardized score, the number of student-authored messages in the associated chatbot interaction, and the total conversation duration in seconds. To make performance comparable across cases with different scoring scales, we standardized each student's score using the maximum observed points earned in that case. Case 7 was delivered without feedback, so performance variables for that case were treated as missing rather than interpreted as true zero scores, although conversation-derived variables were retained. We then created a complete student-by-case grid so that every student had an explicit record for each of the eight cases. Finally, we reshaped the dataset into wide format so that the final database contained one row per unique student and case-specific variables as separate columns.
+
+```{r, eval=FALSE}
+case_max_scores <- attempt_master |>
+  filter(case_number != 7) |>
+  group_by(case_number) |>
+  summarise(
+    case_max_points = max(points_earned_attempt, na.rm = TRUE),
+    .groups = "drop")
+
+student_case_panel <- attempt_master |>
+  arrange(student_id, case_number, attempt_no, attempt_start_ts) |>
+  group_by(student_id, case_number) |>
+  summarise(
+    attempted_case = 1L,
+    points_earned_case = if_else(case_number[1] == 7, NA_real_, first(points_earned_attempt)),
+    student_messages_case = first(student_messages_attempt),
+    conversation_seconds_case = first(conversation_span_seconds),
+    .groups = "drop") |>
+  left_join(case_max_scores, by = "case_number") |>
+  mutate(
+    score_pct_case = case_when(
+      case_number == 7 ~ NA_real_,
+      !is.na(case_max_points) & case_max_points > 0 ~ points_earned_case / case_max_points,
+      TRUE ~ NA_real_)) |>
+  select(-case_max_points)
+
+all_students <- attempt_master |>
+  distinct(student_id) |>
+  filter(!is.na(student_id))
+
+student_case_grid <- tidyr::crossing(
+  all_students,
+  tibble(case_number = 1:8))
+
+student_case_panel_complete <- student_case_grid |>
+  left_join(student_case_panel, by = c("student_id", "case_number")) |>
+  mutate(
+    attempted_case = coalesce(attempted_case, 0L),
+    student_messages_case = coalesce(student_messages_case, 0L),
+    conversation_seconds_case = coalesce(conversation_seconds_case, 0))
+
+student_wide <- student_case_panel_complete |>
+  pivot_wider(
+    names_from = case_number,
+    values_from = c(
+      attempted_case,
+      points_earned_case,
+      score_pct_case,
+      student_messages_case,
+      conversation_seconds_case),
+    names_glue = "{.value}_c{case_number}")
+
+glimpse(student_wide)
+summary(student_wide)
+```
+
+```{r, eval=FALSE}
+dir.create("output", showWarnings = FALSE)
+write_csv(student_wide, "output/student_wide.csv")
+```
